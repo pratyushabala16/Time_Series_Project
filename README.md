@@ -9,4 +9,4 @@
 * And finally,we checked for randomness and accordingly built suitable models like moving average, exponential smoothing , ARMA and ARIMA model for further analysis and forecasting future sales and stock prices. Attached is the Actual vs Fitted Values given by the ARIMA(1,1,1) model.
 
 
-![image width="100",height="100"](https://github.com/user-attachments/assets/635e9c65-c56b-47a6-880f-3ab47209ff33)
+![image](https://github.com/user-attachments/assets/635e9c65-c56b-47a6-880f-3ab47209ff33 = 250x250)
