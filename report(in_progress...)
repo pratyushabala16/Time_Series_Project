@@ -1,0 +1,245 @@
+#The dataset 
+The dataset consists of five .csv files.
+
+* calendar.csv - Contains the dates on which products are sold. The dates are in a yyyy/dd/mm format.
+*sales_train_validation.csv - Contains the historical daily unit sales data per product and store [d_1 - d_1913].
+* submission.csv - Demonstrates the correct format for submission to the competition.
+* sell_prices.csv - Contains information about the price of the products sold per store and date.
+* sales_train_evaluation.csv - Available one month before the competition deadline. It will include sales for [d_1 - d_1941].
+
+We need to forecast the sales for [d_1942 - d_1969]. These rows form the evaluation set.
+The rows [d_1914 - d_1941] form the validation set, and the remaining rows form the training set.
+
+Now, since we understand the dataset and know what to predict, let us visualize the dataset.
+
+#EDA 
+
+import os
+import gc
+import time
+import math
+import datetime
+from math import log, floor
+from sklearn.neighbors import KDTree
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from sklearn.utils import shuffle
+from tqdm.notebook import tqdm as tqdm
+
+import seaborn as sns
+from matplotlib import colors
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+
+import plotly.express as px
+import plotly.graph_objects as go
+import plotly.figure_factory as ff
+from plotly.subplots import make_subplots
+
+import pywt
+from statsmodels.robust import mad
+
+import scipy
+import statsmodels
+from scipy import signal
+import statsmodels.api as sm
+from fbprophet import Prophet
+from scipy.signal import butter, deconvolve
+from statsmodels.tsa.arima_model import ARIMA
+from statsmodels.tsa.api import ExponentialSmoothing, SimpleExpSmoothing, Holt
+
+import warnings
+warnings.filterwarnings("ignore")
+
+#Load the data
+INPUT_DIR = '../input/m5-forecasting-accuracy'
+calendar = pd.read_csv(f'{INPUT_DIR}/calendar.csv')
+selling_prices = pd.read_csv(f'{INPUT_DIR}/sell_prices.csv')
+sample_submission = pd.read_csv(f'{INPUT_DIR}/sample_submission.csv')
+sales_train_val = pd.read_csv(f'{INPUT_DIR}/sales_train_validation.csv')
+
+#Sales data 
+
+ids = sorted(list(set(sales_train_val['id'])))
+d_cols = [c for c in sales_train_val.columns if 'd_' in c]
+x_1 = sales_train_val.loc[sales_train_val['id'] == ids[2]].set_index('id')[d_cols].values[0]
+x_2 = sales_train_val.loc[sales_train_val['id'] == ids[1]].set_index('id')[d_cols].values[0]
+x_3 = sales_train_val.loc[sales_train_val['id'] == ids[17]].set_index('id')[d_cols].values[0]
+
+fig = make_subplots(rows=3, cols=1)
+
+fig.add_trace(go.Scatter(x=np.arange(len(x_1)), y=x_1, showlegend=False,
+                    mode='lines', name="First sample",
+                         marker=dict(color="mediumseagreen")),
+             row=1, col=1)
+
+fig.add_trace(go.Scatter(x=np.arange(len(x_2)), y=x_2, showlegend=False,
+                    mode='lines', name="Second sample",
+                         marker=dict(color="violet")),
+             row=2, col=1)
+
+fig.add_trace(go.Scatter(x=np.arange(len(x_3)), y=x_3, showlegend=False,
+                    mode='lines', name="Third sample",
+                         marker=dict(color="dodgerblue")),
+             row=3, col=1)
+
+fig.update_layout(height=1200, width=800, title_text="Sample sales")
+fig.show()
+
+These are sales data from randomly selected stores in the dataset. As expected, the sales data is very erratic, owing to the fact that so many factors affect the sales on a given day. On certain days, the sales quantity is zero, which indicates that a certain product may not be available on that day (as noted by Rob in his kernel).
+
+
+Sample sales snippets
+ids = sorted(list(set(sales_train_val['id'])))
+d_cols = [c for c in sales_train_val.columns if 'd_' in c]
+x_1 = sales_train_val.loc[sales_train_val['id'] == ids[0]].set_index('id')[d_cols].values[0][:90]
+x_2 = sales_train_val.loc[sales_train_val['id'] == ids[4]].set_index('id')[d_cols].values[0][1300:1400]
+x_3 = sales_train_val.loc[sales_train_val['id'] == ids[65]].set_index('id')[d_cols].values[0][350:450]
+fig = make_subplots(rows=3, cols=1)
+
+fig.add_trace(go.Scatter(x=np.arange(len(x_1)), y=x_1, showlegend=False,
+                    mode='lines+markers', name="First sample",
+                         marker=dict(color="mediumseagreen")),
+             row=1, col=1)
+
+fig.add_trace(go.Scatter(x=np.arange(len(x_2)), y=x_2, showlegend=False,
+                    mode='lines+markers', name="Second sample",
+                         marker=dict(color="violet")),
+             row=2, col=1)
+
+fig.add_trace(go.Scatter(x=np.arange(len(x_3)), y=x_3, showlegend=False,
+                    mode='lines+markers', name="Third sample",
+                         marker=dict(color="dodgerblue")),
+             row=3, col=1)
+
+fig.update_layout(height=1200, width=800, title_text="Sample sales snippets")
+fig.show()
+
+In the above plots,we simply zoom in to sample snippets in the sales data. As stated earlier, we can clearly see that the sales data is very erratic and volatile. Sometimes, the sales are zero for a few days in a row, and at other times, it remains at its peak value for a few days. Therefore, we need some sort of "denoising" techniques to find the underlying trends in the sales data and make forecasts.
+
+##Average smoothing
+Average smooting is a relatively simple way to denoise time series data. In this method, we take a "window" with a fixed size (like 10). We first place the window at the beginning of the time series (first ten elements) and calculate the mean of that section. We now move the window across the time series in the forward direction by a particular "stride", calculate the mean of the new window and repeat the process, until we reach the end of the time series. All the mean values we calculated are then concatenated into a new time series, which forms the denoised sales data.
+
+def average_smoothing(signal, kernel_size=3, stride=1):
+    sample = []
+    start = 0
+    end = kernel_size
+    while end <= len(signal):
+        start = start + stride
+        end = end + stride
+        sample.extend(np.ones(end - start)*np.mean(signal[start:end]))
+    return np.array(sample)
+y_a1 = average_smoothing(x_1)
+y_a2 = average_smoothing(x_2)
+y_a3 = average_smoothing(x_3)
+
+fig = make_subplots(rows=3, cols=1)
+
+fig.add_trace(
+    go.Scatter(x=np.arange(len(x_1)), mode='lines+markers', y=x_1, marker=dict(color="lightskyblue"), showlegend=False,
+               name="Original sales"),
+    row=1, col=1
+)
+
+fig.add_trace(
+    go.Scatter(x=np.arange(len(x_1)), y=y_a1, mode='lines', marker=dict(color="navy"), showlegend=False,
+               name="Denoised sales"),
+    row=1, col=1
+)
+
+fig.add_trace(
+    go.Scatter(x=np.arange(len(x_2)), mode='lines+markers', y=x_2, marker=dict(color="thistle"), showlegend=False),
+    row=2, col=1
+)
+
+fig.add_trace(
+    go.Scatter(x=np.arange(len(x_2)), y=y_a2, mode='lines', marker=dict(color="indigo"), showlegend=False),
+    row=2, col=1
+)
+
+fig.add_trace(
+    go.Scatter(x=np.arange(len(x_3)), mode='lines+markers', y=x_3, marker=dict(color="mediumaquamarine"), showlegend=False),
+    row=3, col=1
+)
+
+fig.add_trace(
+    go.Scatter(x=np.arange(len(x_3)), y=y_a3, mode='lines', marker=dict(color="darkgreen"), showlegend=False),
+    row=3, col=1
+)
+
+fig.update_layout(height=1200, width=800, title_text="Original (pale) vs. Denoised (dark) signals")
+fig.show()
+
+
+In the above graphs, the dark lineplots represent the denoised sales and the light lineplots represent the original sales. We can see that average smoothing is not as effective as Wavelet denoising at finding macroscopic trends and pattersns in the data. A lot of the noise in the original sales persists even after denoising. Therefore, wavelet denoising is clearly more effective at finding trends in the sales data. Nonetheless, average smoothing or "rolling mean" can also be used to calculate useful features for modeling.
+
+The below diagram illustrates these graphs side-by-side. Red graphs represent original sales and green graphs represent denoised sales.
+
+fig, ax = plt.subplots(nrows=3, ncols=2, figsize=(30, 20))
+
+ax[0, 0].plot(x_1, color='seagreen', marker='o') 
+ax[0, 0].set_title('Original Sales', fontsize=24)
+ax[0, 1].plot(y_a1, color='red', marker='.') 
+ax[0, 1].set_title('After Wavelet Denoising', fontsize=24)
+
+ax[1, 0].plot(x_2, color='seagreen', marker='o') 
+ax[1, 0].set_title('Original Sales', fontsize=24)
+ax[1, 1].plot(y_a2, color='red', marker='.') 
+ax[1, 1].set_title('After Wavelet Denoising', fontsize=24)
+
+ax[2, 0].plot(x_3, color='seagreen', marker='o') 
+ax[2, 0].set_title('Original Sales', fontsize=24)
+ax[2, 1].plot(y_a3, color='red', marker='.') 
+ax[2, 1].set_title('After Wavelet Denoising', fontsize=24)
+
+plt.show()
+
+##Stores and states 
+Now, I will look at the sales data across different stores and states in order to gain some useful insights.
+
+Rolling Average Price vs. Time for each store
+past_sales = sales_train_val.set_index('id')[d_cols] \
+    .T \
+    .merge(calendar.set_index('d')['date'],
+           left_index=True,
+           right_index=True,
+            validate='1:1') \
+    .set_index('date')
+
+store_list = selling_prices['store_id'].unique()
+means = []
+fig = go.Figure()
+for s in store_list:
+    store_items = [c for c in past_sales.columns if s in c]
+    data = past_sales[store_items].sum(axis=1).rolling(90).mean()
+    means.append(np.mean(past_sales[store_items].sum(axis=1)))
+    fig.add_trace(go.Scatter(x=np.arange(len(data)), y=data, name=s))
+    
+fig.update_layout(yaxis_title="Sales", xaxis_title="Time", title="Rolling Average Sales vs. Time (per store)")
+
+In the above graph, I have plotted rolling sales across all stores in the dataset. Almost every sales curve has "linear oscillation" trend at the macroscopic level. Basically, the sales oscillate like a sine wave about a certain mean value, but this mean value has an upward linear trend. This implies that the sales are oscillating at a higher and higher level every few months.
+
+This trend is reminiscent of the business cycle, where economies have short-term oscillatory fluctuations but grow linearly in the long run. Maybe, such small-scale trends at the level of stores add up to decide trends we see at the macroeconomic level. Below is an illustration of the macroeconomic business cycle:
+
+fig = go.Figure()
+
+for i, s in enumerate(store_list):
+        store_items = [c for c in past_sales.columns if s in c]
+        data = past_sales[store_items].sum(axis=1).rolling(90).mean()
+        fig.add_trace(go.Box(x=[s]*len(data), y=data, name=s))
+    
+fig.update_layout(yaxis_title="Sales", xaxis_title="Time", title="Rolling Average Sales vs. Store name ")
+
+The above plot compares the sales distribution for each store in the dataset. The stores in California seem to have the highest variance in sales, which might indicate that some places in California grow significantly faster than others, i.e. there is development disparity. On the other hand, the Wisconsin and Texas sales seem to be quite consistent among themselves, without much variance. This indicates that development might be more uniform in these states. Moreover, the California stores also seem to have the highest overall mean sales.
+
+df = pd.DataFrame(np.transpose([means, store_list]))
+df.columns = ["Mean sales", "Store name"]
+px.bar(df, y="Mean sales", x="Store name", color="Store name", title="Mean sales vs. Store name")
+
+From the above graph, we can see the same trends: California stores have the highest variance and mean sales among all the stores in the dataset.
+
+#Modeling 
+train_dataset = sales_train_val[d_cols[-100:-30]]
+val_dataset = sales_train_val[d_cols[-30:]]
